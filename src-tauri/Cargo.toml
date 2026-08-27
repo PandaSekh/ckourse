@@ -33,6 +33,13 @@ tokio = { version = "1", features = ["time"] }
 sha2 = "0.10"
 base64 = "0.22"
 getrandom = "0.2"
+async-trait = "0.1.92"
+russh = "0.63.1"
+russh-sftp = "2.4.0"
+rusty-s3 = "0.10.2"
+quick-xml = "0.42.0"
+url = "2.5.8"
+uuid = { version = "1.26.0", features = ["v4"] }
 
 # OS keychain for Google Drive OAuth tokens — backend differs per platform.
 [target.'cfg(target_os = "macos")'.dependencies]

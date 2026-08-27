@@ -1528,30 +1528,36 @@ fn detect_thumbnail(files: &[FileEntry]) -> Option<String> {
 }
 
 // =====================================================================
-// Google Drive source
+// Remote sources (Google Drive, SFTP, WebDAV, S3)
 //
 // The local parser above walks the filesystem lazily and probes durations with
-// ffprobe. Drive can't do either, so the caller fetches the whole subtree via
-// files.list into an in-memory `DriveEntry` tree (durations come from Drive
-// metadata) and we run the SAME heuristics over it here — reusing every pure
-// helper above (sorting, name cleaning, classification, subtitle matching,
-// affix stripping). Only the I/O differs; `parse_folder` and its tests are
-// untouched. Video/subtitle/resource paths are stored as `gdrive:<fileId>` so
-// progress/resume keys on the Drive file id and the gdrive:// protocol can
-// stream them.
+// ffprobe. No remote source can do either, so the caller fetches the whole
+// subtree up front into an in-memory `SourceEntry` tree and we run the SAME
+// heuristics over it here — reusing every pure helper above (sorting, name
+// cleaning, classification, subtitle matching, affix stripping). Only the I/O
+// differs; `parse_folder` and its tests are untouched.
+//
+// Each entry carries the `uri` it should be stored under (`gdrive:<fileId>`,
+// `srv:<serverId>:<path>`), so progress/resume keys on a stable identifier and
+// the matching URI-scheme protocol can stream it back.
 // =====================================================================
 
-/// An in-memory node from a Drive `files.list` traversal.
-pub struct DriveEntry {
-    pub id: String,
+/// An in-memory node from a remote listing (Drive files.list, SFTP readdir,
+/// WebDAV PROPFIND, S3 ListObjectsV2).
+pub struct SourceEntry {
+    /// The URI this entry is stored as — `gdrive:<fileId>` or `srv:<serverId>:<path>`.
+    pub uri: String,
     pub name: String,
-    /// Drive mimeType (e.g. "video/mp4", "application/vnd.google-apps.folder").
+    /// MIME type (e.g. "video/mp4", "application/vnd.google-apps.folder").
+    /// Sources that don't report one leave this empty and classification falls
+    /// back to the file extension.
     pub mime_type: String,
     pub is_folder: bool,
-    /// Seconds (from videoMediaMetadata.durationMillis); 0 for non-videos/folders.
+    /// Seconds, when the source reports it (Drive's videoMediaMetadata); 0
+    /// otherwise — the player backfills it on first playback.
     pub duration_secs: u64,
     /// Populated for folders.
-    pub children: Vec<DriveEntry>,
+    pub children: Vec<SourceEntry>,
 }
 
 fn ext_of(name: &str) -> String {
@@ -1562,7 +1568,7 @@ fn ext_of(name: &str) -> String {
 
 /// Drive video files often have no extension in their name, so classify by
 /// mimeType or the presence of a probed duration — not just the extension.
-fn is_drive_video(e: &DriveEntry) -> bool {
+fn is_source_video(e: &SourceEntry) -> bool {
     !e.is_folder
         && (e.mime_type.starts_with("video/")
             || is_video(&ext_of(&e.name))
@@ -1570,16 +1576,16 @@ fn is_drive_video(e: &DriveEntry) -> bool {
         && !is_sample_video(&e.name)
 }
 
-struct DriveSplit<'a> {
-    videos: Vec<&'a DriveEntry>,
+struct SourceSplit<'a> {
+    videos: Vec<&'a SourceEntry>,
     /// Direct subtitle files + those inside subtitle-only subfolders (Subs/, etc.).
-    subtitles: Vec<&'a DriveEntry>,
-    other: Vec<&'a DriveEntry>,
-    content_folders: Vec<&'a DriveEntry>,
+    subtitles: Vec<&'a SourceEntry>,
+    other: Vec<&'a SourceEntry>,
+    content_folders: Vec<&'a SourceEntry>,
 }
 
 /// Classify a folder's children the same way the local parser classifies a directory.
-fn split_drive_children(children: &[DriveEntry]) -> DriveSplit<'_> {
+fn split_source_children(children: &[SourceEntry]) -> SourceSplit<'_> {
     let mut videos = Vec::new();
     let mut subtitles = Vec::new();
     let mut other = Vec::new();
@@ -1598,7 +1604,7 @@ fn split_drive_children(children: &[DriveEntry]) -> DriveSplit<'_> {
             }
         } else {
             let ext = ext_of(&c.name);
-            if is_drive_video(c) {
+            if is_source_video(c) {
                 videos.push(c);
             } else if is_subtitle(&ext) {
                 subtitles.push(c);
@@ -1612,19 +1618,19 @@ fn split_drive_children(children: &[DriveEntry]) -> DriveSplit<'_> {
         }
     }
 
-    DriveSplit { videos, subtitles, other, content_folders }
+    SourceSplit { videos, subtitles, other, content_folders }
 }
 
-fn drive_folder_has_videos(folder: &DriveEntry) -> bool {
+fn source_folder_has_videos(folder: &SourceEntry) -> bool {
     for c in &folder.children {
         if !c.is_folder {
-            if is_drive_video(c) {
+            if is_source_video(c) {
                 return true;
             }
         } else {
             // One level deeper (Pattern 3).
             for d in &c.children {
-                if is_drive_video(d) {
+                if is_source_video(d) {
                     return true;
                 }
             }
@@ -1634,7 +1640,7 @@ fn drive_folder_has_videos(folder: &DriveEntry) -> bool {
 }
 
 /// Numeric-aware comparator matching the local `build_lessons_from_files` sort.
-fn drive_name_cmp(a: &DriveEntry, b: &DriveEntry, has_numbers: bool) -> std::cmp::Ordering {
+fn source_name_cmp(a: &SourceEntry, b: &SourceEntry, has_numbers: bool) -> std::cmp::Ordering {
     if has_numbers {
         let na = extract_leading_number(&a.name).or_else(|| extract_embedded_number(&a.name));
         let nb = extract_leading_number(&b.name).or_else(|| extract_embedded_number(&b.name));
@@ -1649,18 +1655,18 @@ fn drive_name_cmp(a: &DriveEntry, b: &DriveEntry, has_numbers: bool) -> std::cmp
     }
 }
 
-fn build_lessons_from_drive(
-    videos: &[&DriveEntry],
-    subtitles: &[&DriveEntry],
-    other_files: &[&DriveEntry],
+fn build_lessons_from_source(
+    videos: &[&SourceEntry],
+    subtitles: &[&SourceEntry],
+    other_files: &[&SourceEntry],
 ) -> (Vec<ParsedLesson>, bool) {
-    let mut sorted_videos: Vec<&&DriveEntry> = videos.iter().collect();
+    let mut sorted_videos: Vec<&&SourceEntry> = videos.iter().collect();
     let has_numbers = sorted_videos.iter().any(|v| {
         extract_leading_number(&v.name).is_some() || extract_embedded_number(&v.name).is_some()
     });
-    sorted_videos.sort_by(|a, b| drive_name_cmp(a, b, has_numbers));
+    sorted_videos.sort_by(|a, b| source_name_cmp(a, b, has_numbers));
 
-    let mut subtitle_map: HashMap<String, Vec<&DriveEntry>> = HashMap::new();
+    let mut subtitle_map: HashMap<String, Vec<&SourceEntry>> = HashMap::new();
     for sub in subtitles {
         subtitle_map
             .entry(subtitle_base_name(&sub.name).to_lowercase())
@@ -1668,8 +1674,8 @@ fn build_lessons_from_drive(
             .push(sub);
     }
 
-    let mut sorted_subtitles: Vec<&&DriveEntry> = subtitles.iter().collect();
-    sorted_subtitles.sort_by(|a, b| drive_name_cmp(a, b, has_numbers));
+    let mut sorted_subtitles: Vec<&&SourceEntry> = subtitles.iter().collect();
+    sorted_subtitles.sort_by(|a, b| source_name_cmp(a, b, has_numbers));
 
     let mut used_positional = false;
     let mut lessons = Vec::new();
@@ -1682,7 +1688,7 @@ fn build_lessons_from_drive(
         if let Some(subs) = subtitle_map.get(&video_base.to_lowercase()) {
             for sub in subs {
                 matched_subs.push(ParsedSubtitle {
-                    path: format!("gdrive:{}", sub.id),
+                    path: sub.uri.clone(),
                     language: extract_subtitle_language(&sub.name, &video_base),
                     is_positional_match: false,
                 });
@@ -1692,7 +1698,7 @@ fn build_lessons_from_drive(
         if matched_subs.is_empty() && sorted_subtitles.len() == sorted_videos.len() {
             if let Some(sub) = sorted_subtitles.get(i) {
                 matched_subs.push(ParsedSubtitle {
-                    path: format!("gdrive:{}", sub.id),
+                    path: sub.uri.clone(),
                     language: None,
                     is_positional_match: true,
                 });
@@ -1711,7 +1717,7 @@ fn build_lessons_from_drive(
             if file_base == video_base.to_lowercase() {
                 lesson_resources.push(ParsedResource {
                     title: clean_display_name(&file.name),
-                    path: format!("gdrive:{}", file.id),
+                    path: file.uri.clone(),
                     resource_type: classify_resource(&ext_of(&file.name), &file.name),
                 });
             }
@@ -1720,7 +1726,7 @@ fn build_lessons_from_drive(
         lessons.push(ParsedLesson {
             title: clean_title,
             order: i,
-            video_path: format!("gdrive:{}", video.id),
+            video_path: video.uri.clone(),
             duration_secs: video.duration_secs,
             subtitles: matched_subs,
             resources: lesson_resources,
@@ -1736,20 +1742,20 @@ fn build_lessons_from_drive(
     (lessons, used_positional)
 }
 
-/// Build a `ParsedCourse` from an in-memory Drive subtree. Mirrors `parse_folder`'s
-/// Pattern 1–4 detection. `root_id` is the picked folder's Drive id (stored as the
+/// Build a `ParsedCourse` from an in-memory remote subtree. Mirrors `parse_folder`'s
+/// Pattern 1–4 detection. `root_uri` identifies the picked root (stored as the
 /// course's `folder_path` so it can be re-synced later).
-pub fn parse_drive(
+pub fn parse_source_tree(
     root_name: &str,
-    root_children: Vec<DriveEntry>,
-    root_id: &str,
+    root_children: Vec<SourceEntry>,
+    root_uri: &str,
 ) -> Result<ParsedCourse, String> {
     let title = clean_display_name(root_name);
-    let root = split_drive_children(&root_children);
+    let root = split_source_children(&root_children);
 
     let has_root_videos = !root.videos.is_empty();
     let has_subfolders = !root.content_folders.is_empty();
-    let subfolders_have_videos = root.content_folders.iter().any(|f| drive_folder_has_videos(f));
+    let subfolders_have_videos = root.content_folders.iter().any(|f| source_folder_has_videos(f));
 
     if !has_root_videos && !subfolders_have_videos {
         return Err("No video files found in this folder".to_string());
@@ -1762,7 +1768,7 @@ pub fn parse_drive(
 
     if has_root_videos && !has_subfolders {
         // Pattern 1: Flat
-        let (lessons, pos) = build_lessons_from_drive(&root.videos, &root.subtitles, &root.other);
+        let (lessons, pos) = build_lessons_from_source(&root.videos, &root.subtitles, &root.other);
         used_positional = pos;
         sections.push(ParsedSection { title: title.clone(), order: 0, lessons });
     } else if !has_root_videos && has_subfolders && subfolders_have_videos {
@@ -1771,18 +1777,18 @@ pub fn parse_drive(
         folders.sort_by(|a, b| extract_sort_key(&a.name).cmp(&extract_sort_key(&b.name)));
 
         for (i, folder) in folders.iter().enumerate() {
-            let sub = split_drive_children(&folder.children);
+            let sub = split_source_children(&folder.children);
 
             if sub.videos.is_empty() && !sub.content_folders.is_empty() {
                 // Pattern 3: Two levels
                 let mut subfolders = sub.content_folders.clone();
                 subfolders.sort_by(|a, b| extract_sort_key(&a.name).cmp(&extract_sort_key(&b.name)));
                 for (j, sf) in subfolders.iter().enumerate() {
-                    let ss = split_drive_children(&sf.children);
+                    let ss = split_source_children(&sf.children);
                     if ss.videos.is_empty() {
                         continue;
                     }
-                    let (lessons, pos) = build_lessons_from_drive(&ss.videos, &ss.subtitles, &ss.other);
+                    let (lessons, pos) = build_lessons_from_source(&ss.videos, &ss.subtitles, &ss.other);
                     if pos {
                         used_positional = true;
                     }
@@ -1798,7 +1804,7 @@ pub fn parse_drive(
                 }
             } else if !sub.videos.is_empty() {
                 // Pattern 2: Direct section with videos
-                let (lessons, pos) = build_lessons_from_drive(&sub.videos, &sub.subtitles, &sub.other);
+                let (lessons, pos) = build_lessons_from_source(&sub.videos, &sub.subtitles, &sub.other);
                 if pos {
                     used_positional = true;
                 }
@@ -1808,7 +1814,7 @@ pub fn parse_drive(
                             if !file.is_folder && !is_hidden(&file.name) {
                                 course_resources.push(ParsedResource {
                                     title: file.name.clone(),
-                                    path: format!("gdrive:{}", file.id),
+                                    path: file.uri.clone(),
                                     resource_type: ResourceType::Code,
                                 });
                             }
@@ -1824,7 +1830,7 @@ pub fn parse_drive(
         }
     } else if has_root_videos && has_subfolders {
         // Pattern 4: Mixed
-        let (root_lessons, pos) = build_lessons_from_drive(&root.videos, &root.subtitles, &root.other);
+        let (root_lessons, pos) = build_lessons_from_source(&root.videos, &root.subtitles, &root.other);
         if pos {
             used_positional = true;
         }
@@ -1837,11 +1843,11 @@ pub fn parse_drive(
         let mut folders = root.content_folders.clone();
         folders.sort_by(|a, b| extract_sort_key(&a.name).cmp(&extract_sort_key(&b.name)));
         for (i, folder) in folders.iter().enumerate() {
-            let sub = split_drive_children(&folder.children);
+            let sub = split_source_children(&folder.children);
             if sub.videos.is_empty() {
                 continue;
             }
-            let (lessons, pos) = build_lessons_from_drive(&sub.videos, &sub.subtitles, &sub.other);
+            let (lessons, pos) = build_lessons_from_source(&sub.videos, &sub.subtitles, &sub.other);
             if pos {
                 used_positional = true;
             }
@@ -1867,7 +1873,7 @@ pub fn parse_drive(
                     .map(|(n, _)| n.to_string())
                     .unwrap_or_else(|| file.name.clone()),
             ),
-            path: format!("gdrive:{}", file.id),
+            path: file.uri.clone(),
             resource_type: rt,
         });
     }
@@ -1906,13 +1912,97 @@ pub fn parse_drive(
         confidence,
         confidence_reasons,
         total_video_count,
-        folder_path: format!("gdrive:{}", root_id),
+        folder_path: root_uri.to_string(),
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- remote sources (SFTP / WebDAV / S3) ---
+    //
+    // Remote listings report no MIME type and no duration, so classification
+    // rests entirely on the file extension — unlike Drive, which supplies both.
+
+    fn remote_file(name: &str) -> SourceEntry {
+        SourceEntry {
+            uri: format!("srv:srv-1:/Course/{name}"),
+            name: name.to_string(),
+            mime_type: String::new(),
+            is_folder: false,
+            duration_secs: 0,
+            children: Vec::new(),
+        }
+    }
+
+    fn remote_folder(name: &str, children: Vec<SourceEntry>) -> SourceEntry {
+        SourceEntry {
+            uri: format!("srv:srv-1:/Course/{name}"),
+            name: name.to_string(),
+            mime_type: String::new(),
+            is_folder: true,
+            duration_secs: 0,
+            children,
+        }
+    }
+
+    #[test]
+    fn remote_flat_course_detects_videos_by_extension() {
+        let children = vec![
+            remote_file("01 - Intro.mp4"),
+            remote_file("02 - Setup.mkv"),
+            remote_file("notes.pdf"),
+        ];
+        let course = parse_source_tree("Rust 101", children, "srv:srv-1:/Course").unwrap();
+
+        assert_eq!(course.total_video_count, 2);
+        assert_eq!(course.folder_path, "srv:srv-1:/Course");
+        assert_eq!(course.sections[0].lessons[0].video_path, "srv:srv-1:/Course/01 - Intro.mp4");
+        // The PDF is a course resource, not a lesson.
+        assert_eq!(course.resources.len(), 1);
+    }
+
+    #[test]
+    fn remote_lessons_have_no_duration_until_played() {
+        let children = vec![remote_file("01 - Intro.mp4")];
+        let course = parse_source_tree("Rust", children, "srv:srv-1:/Course").unwrap();
+        assert_eq!(course.sections[0].lessons[0].duration_secs, 0);
+    }
+
+    #[test]
+    fn remote_section_folders_become_sections() {
+        let children = vec![
+            remote_folder("01 - Basics", vec![remote_file("01 - Hello.mp4")]),
+            remote_folder("02 - Advanced", vec![remote_file("01 - Traits.mp4")]),
+        ];
+        let course = parse_source_tree("Rust", children, "srv:srv-1:/Course").unwrap();
+
+        assert_eq!(course.sections.len(), 2);
+        assert_eq!(course.sections[0].title, "Basics");
+        assert_eq!(course.sections[1].title, "Advanced");
+        assert_eq!(course.total_video_count, 2);
+    }
+
+    #[test]
+    fn remote_subtitles_match_their_video() {
+        let children = vec![
+            remote_file("01 - Intro.mp4"),
+            remote_file("01 - Intro.srt"),
+        ];
+        let course = parse_source_tree("Rust", children, "srv:srv-1:/Course").unwrap();
+        let lesson = &course.sections[0].lessons[0];
+
+        assert_eq!(lesson.subtitles.len(), 1);
+        assert_eq!(lesson.subtitles[0].path, "srv:srv-1:/Course/01 - Intro.srt");
+        assert!(!lesson.subtitles[0].is_positional_match);
+    }
+
+    #[test]
+    fn remote_folder_with_no_videos_is_rejected() {
+        let children = vec![remote_file("readme.txt"), remote_file("notes.pdf")];
+        assert!(parse_source_tree("Empty", children, "srv:srv-1:/Course").is_err());
+    }
 
     // --- extract_leading_number ---
 

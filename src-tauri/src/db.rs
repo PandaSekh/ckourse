@@ -227,6 +227,21 @@ pub fn init_db(app_data_dir: &Path) -> SqlResult<Connection> {
             name TEXT NOT NULL UNIQUE
         );
 
+        CREATE TABLE IF NOT EXISTS servers (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            host TEXT NOT NULL DEFAULT '',
+            port INTEGER NOT NULL DEFAULT 22,
+            username TEXT NOT NULL DEFAULT '',
+            base_path TEXT NOT NULL DEFAULT '/',
+            bucket TEXT NOT NULL DEFAULT '',
+            region TEXT NOT NULL DEFAULT '',
+            path_style INTEGER NOT NULL DEFAULT 1,
+            host_fingerprint TEXT,
+            created_at TEXT NOT NULL
+        );
+
         CREATE INDEX IF NOT EXISTS idx_sections_course_id ON sections(course_id);
         CREATE INDEX IF NOT EXISTS idx_lessons_section_id ON lessons(section_id);
         CREATE INDEX IF NOT EXISTS idx_lessons_completed ON lessons(completed);
@@ -245,6 +260,25 @@ pub fn init_db(app_data_dir: &Path) -> SqlResult<Connection> {
     // Source type (local folder vs Google Drive) for existing databases
     let _ = conn.execute_batch(
         "ALTER TABLE courses ADD COLUMN source_type TEXT NOT NULL DEFAULT 'local';",
+    );
+
+    // Saved servers (SFTP / WebDAV / S3) for existing databases. Secrets live in
+    // the OS keychain keyed by `id`, never in this table.
+    let _ = conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS servers (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            host TEXT NOT NULL DEFAULT '',
+            port INTEGER NOT NULL DEFAULT 22,
+            username TEXT NOT NULL DEFAULT '',
+            base_path TEXT NOT NULL DEFAULT '/',
+            bucket TEXT NOT NULL DEFAULT '',
+            region TEXT NOT NULL DEFAULT '',
+            path_style INTEGER NOT NULL DEFAULT 1,
+            host_fingerprint TEXT,
+            created_at TEXT NOT NULL
+        );",
     );
 
     // Bookmarks table migration for existing databases
@@ -315,9 +349,12 @@ fn save_parsed_course_inner(
     input: &SaveCourseInput,
     now: &str,
 ) -> SqlResult<i64> {
-    // Drive courses carry a `gdrive:<rootId>` folder_path; everything else is local.
+    // The folder_path's prefix identifies the source: `gdrive:<rootId>` for
+    // Drive, `srv:<serverId>:<path>` for a saved server, a filesystem path otherwise.
     let source_type = if parsed.folder_path.starts_with("gdrive:") {
         "drive"
+    } else if parsed.folder_path.starts_with(crate::remote::URI_PREFIX) {
+        "remote"
     } else {
         "local"
     };
@@ -1454,4 +1491,97 @@ pub fn search_content(conn: &Connection, query: &str) -> SqlResult<Vec<SearchRes
     }
 
     Ok(results)
+}
+
+// =====================================================================
+// Saved servers (SFTP / WebDAV / S3)
+//
+// Only non-secret configuration lives here. Passwords, private keys and S3
+// secret keys are stored in the OS keychain by `crate::remote`, keyed by `id`.
+// =====================================================================
+
+fn server_from_row(row: &rusqlite::Row<'_>) -> SqlResult<crate::remote::ServerConfig> {
+    let kind: String = row.get(2)?;
+    Ok(crate::remote::ServerConfig {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        // A row with an unrecognised kind would be from a newer version of the
+        // app; fall back rather than failing the whole listing.
+        kind: crate::remote::ServerKind::parse(&kind)
+            .unwrap_or(crate::remote::ServerKind::Sftp),
+        host: row.get(3)?,
+        port: row.get::<_, i64>(4)? as u16,
+        username: row.get(5)?,
+        base_path: row.get(6)?,
+        bucket: row.get(7)?,
+        region: row.get(8)?,
+        path_style: row.get::<_, i64>(9)? != 0,
+        host_fingerprint: row.get(10)?,
+    })
+}
+
+const SERVER_COLUMNS: &str =
+    "id, name, kind, host, port, username, base_path, bucket, region, path_style, host_fingerprint";
+
+pub fn get_servers(conn: &Connection) -> SqlResult<Vec<crate::remote::ServerConfig>> {
+    let sql = format!("SELECT {SERVER_COLUMNS} FROM servers ORDER BY name COLLATE NOCASE");
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map([], server_from_row)?;
+    rows.collect()
+}
+
+pub fn upsert_server(conn: &Connection, config: &crate::remote::ServerConfig) -> SqlResult<()> {
+    conn.execute(
+        "INSERT INTO servers (id, name, kind, host, port, username, base_path, bucket, region, path_style, host_fingerprint, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+         ON CONFLICT(id) DO UPDATE SET
+            name = excluded.name,
+            kind = excluded.kind,
+            host = excluded.host,
+            port = excluded.port,
+            username = excluded.username,
+            base_path = excluded.base_path,
+            bucket = excluded.bucket,
+            region = excluded.region,
+            path_style = excluded.path_style",
+        params![
+            config.id,
+            config.name,
+            config.kind.as_str(),
+            config.host,
+            config.port as i64,
+            config.username,
+            config.base_path,
+            config.bucket,
+            config.region,
+            config.path_style as i64,
+            config.host_fingerprint,
+            chrono_now(),
+        ],
+    )?;
+    Ok(())
+}
+
+pub fn delete_server(conn: &Connection, id: &str) -> SqlResult<()> {
+    conn.execute("DELETE FROM servers WHERE id = ?1", params![id])?;
+    Ok(())
+}
+
+pub fn set_server_fingerprint(conn: &Connection, id: &str, fingerprint: &str) -> SqlResult<()> {
+    conn.execute(
+        "UPDATE servers SET host_fingerprint = ?2 WHERE id = ?1",
+        params![id, fingerprint],
+    )?;
+    Ok(())
+}
+
+/// How many courses were imported from a given server — shown before removing
+/// it, since those courses stop playing once the connection is gone.
+pub fn count_courses_for_server(conn: &Connection, id: &str) -> SqlResult<i64> {
+    let pattern = format!("{}{}:%", crate::remote::URI_PREFIX, id);
+    conn.query_row(
+        "SELECT COUNT(*) FROM courses WHERE folder_path LIKE ?1",
+        params![pattern],
+        |row| row.get(0),
+    )
 }

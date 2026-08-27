@@ -20,6 +20,7 @@ import {
   DotsSixVerticalIcon as DotsSixVertical,
   PencilSimpleIcon as PencilSimple,
   CloudIcon as Cloud,
+  HardDrivesIcon as HardDrives,
 } from "@phosphor-icons/react";
 import {
   DndContext,
@@ -50,6 +51,8 @@ import {
   drivePickFolder,
   parseDriveFolder,
 } from "@/lib/drive";
+import { getServers, parseServerFolder, type ServerConfig } from "@/lib/servers";
+import { ServerBrowser } from "@/components/ServerBrowser";
 import { importCourse, getCustomCategories, addCustomCategory, deleteCustomCategory } from "@/lib/store";
 import { EASE_OUT } from "@/lib/constants";
 
@@ -95,6 +98,8 @@ export function ImportCourse({ className }: ImportCourseProps) {
   const [step, setStep] = useState<"select" | "configure">("select");
   const [isDragOver, setIsDragOver] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
+  const [servers, setServers] = useState<ServerConfig[]>([]);
+  const [browsing, setBrowsing] = useState(false);
   const [parseError, setParseError] = useState<string | null>(null);
   const [errorNeedsSettings, setErrorNeedsSettings] = useState(false);
 
@@ -177,6 +182,40 @@ export function ImportCourse({ className }: ImportCourseProps) {
         return;
       }
       showError(msg || "Failed to import from Google Drive");
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const handleServerImport = async () => {
+    showError(null);
+    try {
+      const saved = await getServers();
+      if (saved.length === 0) {
+        showError("Add a server in Settings before importing from one.", true);
+        return;
+      }
+      setServers(saved);
+      setBrowsing(true);
+    } catch (err) {
+      showError(typeof err === "string" ? err : "Couldn't load your servers");
+    }
+  };
+
+  // The browser lists one directory at a time; walking the whole tree only
+  // happens here, once the user has committed to a folder.
+  const handleServerFolderPicked = async (
+    server: ServerConfig,
+    path: string,
+    name: string,
+  ) => {
+    setBrowsing(false);
+    setIsLoading(true);
+    showError(null);
+    try {
+      applyParsed(await parseServerFolder(server.id, path, name || server.name));
+    } catch (err) {
+      showError(typeof err === "string" ? err : "Couldn't read that folder");
     } finally {
       setIsLoading(false);
     }
@@ -333,6 +372,7 @@ export function ImportCourse({ className }: ImportCourseProps) {
           onDrop={handleDrop}
           onBrowse={handleFolderSelect}
           onImportDrive={handleDriveImport}
+          onImportServer={handleServerImport}
         />
       ) : parsedCourse ? (
         <ConfigureStep
@@ -355,6 +395,14 @@ export function ImportCourse({ className }: ImportCourseProps) {
           onImport={handleImport}
         />
       ) : null}
+
+      {browsing && (
+        <ServerBrowser
+          servers={servers}
+          onPick={handleServerFolderPicked}
+          onClose={() => setBrowsing(false)}
+        />
+      )}
     </div>
   );
 }
@@ -370,6 +418,7 @@ function FolderSelectStep({
   onDrop,
   onBrowse,
   onImportDrive,
+  onImportServer,
 }: {
   isDragOver: boolean;
   isLoading: boolean;
@@ -381,6 +430,7 @@ function FolderSelectStep({
   onDrop: (e: React.DragEvent) => void;
   onBrowse: () => void;
   onImportDrive: () => void;
+  onImportServer: () => void;
 }) {
   return (
     <div style={{ animation: `card-in 350ms ${EASE_OUT} 50ms both` }}>
@@ -474,6 +524,20 @@ function FolderSelectStep({
       >
         <Cloud className="size-4 text-muted-foreground" />
         Import from Google Drive
+      </button>
+
+      <button
+        type="button"
+        onClick={isLoading ? undefined : onImportServer}
+        disabled={isLoading}
+        className={cn(
+          "mt-2 flex w-full items-center justify-center gap-2 rounded-xl border border-border bg-card px-4 py-3",
+          "font-sans text-sm font-medium text-foreground transition-colors",
+          "hover:bg-secondary disabled:opacity-50",
+        )}
+      >
+        <HardDrives className="size-4 text-muted-foreground" />
+        Import from a server
       </button>
 
       {error && (

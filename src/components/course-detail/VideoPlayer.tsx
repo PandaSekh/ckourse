@@ -298,12 +298,16 @@ export const VideoPlayer = forwardRef<VideoPlayerHandle, VideoPlayerProps>(funct
   const preferredSubLangRef = useRef<string | null>(null);
   const playbackSpeedRef = useRef(playbackSpeed);
 
-  // Local lessons stream from disk via the `stream://` protocol; Google Drive
-  // lessons store `gdrive:<fileId>` and stream via the `gdrive://` protocol.
+  // Each source has its own streaming protocol: local lessons read from disk via
+  // `stream://`, Drive lessons store `gdrive:<fileId>`, and lessons on a saved
+  // server store `srv:<serverId>:<path>`. All three support range requests, so
+  // seeking works the same way everywhere.
   const videoSrc = lesson
     ? lesson.videoPath.startsWith("gdrive:")
       ? convertFileSrc(lesson.videoPath.slice("gdrive:".length), "gdrive")
-      : convertFileSrc(lesson.videoPath, "stream")
+      : lesson.videoPath.startsWith("srv:")
+        ? convertFileSrc(lesson.videoPath.slice("srv:".length), "srv")
+        : convertFileSrc(lesson.videoPath, "stream")
     : undefined;
 
   // Reset state when lesson changes
@@ -780,6 +784,12 @@ export const VideoPlayer = forwardRef<VideoPlayerHandle, VideoPlayerProps>(funct
         setLoadError("Your Google Drive connection expired. Reconnect to keep watching.");
         return;
       }
+    }
+    if (lesson?.videoPath.startsWith("srv:")) {
+      setLoadError(
+        "Couldn't reach the server for this lesson. Check it's online and that the course folder hasn't moved.",
+      );
+      return;
     }
     setLoadError("Couldn't load this video. Check your connection and try again.");
   }, [lesson?.videoPath]);

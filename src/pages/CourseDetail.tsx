@@ -18,6 +18,7 @@ import {
   BookmarkSimpleIcon as BookmarkSimple,
   HeartIcon as Heart,
   GoogleDriveLogoIcon as GoogleDriveLogo,
+  HardDrivesIcon as HardDrives,
 } from "@phosphor-icons/react";
 import { cn } from "@/lib/utils";
 import { reportError } from "@/lib/posthog";
@@ -746,6 +747,15 @@ function CourseDetailInner({
                 >
                   <GoogleDriveLogo className="size-3.5 text-info" weight="fill" />
                   Google Drive
+                </span>
+              )}
+              {course.folderPath.startsWith("srv:") && (
+                <span
+                  className="flex items-center gap-1 rounded-full border border-border/60 bg-secondary px-2 py-1 font-sans text-[11px] font-medium text-muted-foreground"
+                  title="Streamed from your server"
+                >
+                  <HardDrives className="size-3.5 text-info" weight="fill" />
+                  Server
                 </span>
               )}
             </div>
