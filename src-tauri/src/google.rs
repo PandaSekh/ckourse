@@ -307,7 +307,7 @@ pub async fn parse_drive_folder(
     let token = valid_access_token().await?;
     let client = reqwest::Client::new();
     let children = list_folder_recursive(&client, &token, &folder_id).await?;
-    crate::parser::parse_drive(&folder_name, children, &folder_id)
+    crate::parser::parse_source_tree(&folder_name, children, &format!("gdrive:{folder_id}"))
 }
 
 /// Download a (small) Drive file's bytes via alt=media — used for subtitles.
@@ -334,7 +334,7 @@ fn list_folder_recursive<'a>(
     token: &'a str,
     folder_id: &'a str,
 ) -> std::pin::Pin<
-    Box<dyn std::future::Future<Output = Result<Vec<crate::parser::DriveEntry>, String>> + Send + 'a>,
+    Box<dyn std::future::Future<Output = Result<Vec<crate::parser::SourceEntry>, String>> + Send + 'a>,
 > {
     Box::pin(async move {
         let mut entries = Vec::new();
@@ -370,8 +370,8 @@ fn list_folder_recursive<'a>(
             for f in list.files {
                 if f.mime_type == FOLDER_MIME {
                     let children = list_folder_recursive(client, token, &f.id).await?;
-                    entries.push(crate::parser::DriveEntry {
-                        id: f.id,
+                    entries.push(crate::parser::SourceEntry {
+                        uri: format!("gdrive:{}", f.id),
                         name: f.name,
                         mime_type: f.mime_type,
                         is_folder: true,
@@ -385,8 +385,8 @@ fn list_folder_recursive<'a>(
                         .and_then(|ms| ms.parse::<u64>().ok())
                         .map(|ms| ms / 1000)
                         .unwrap_or(0);
-                    entries.push(crate::parser::DriveEntry {
-                        id: f.id,
+                    entries.push(crate::parser::SourceEntry {
+                        uri: format!("gdrive:{}", f.id),
                         name: f.name,
                         mime_type: f.mime_type,
                         is_folder: false,

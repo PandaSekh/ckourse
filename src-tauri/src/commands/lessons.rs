@@ -54,6 +54,9 @@ pub async fn get_subtitle_vtt(path: String) -> Result<String, String> {
     if let Some(file_id) = path.strip_prefix("gdrive:") {
         let bytes = crate::google::fetch_file_bytes(file_id.to_string()).await?;
         subtitle::convert_bytes_to_vtt(&bytes)
+    } else if path.starts_with(crate::remote::URI_PREFIX) {
+        let bytes = crate::remote::read_uri(&path).await?;
+        subtitle::convert_bytes_to_vtt(&bytes)
     } else {
         subtitle::read_as_vtt(&path)
     }

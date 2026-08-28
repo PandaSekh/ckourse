@@ -3,6 +3,9 @@ mod db;
 mod drive_protocol;
 mod google;
 mod parser;
+mod remote;
+mod remote_protocol;
+mod stream_cache;
 mod subtitle;
 mod video_protocol;
 
@@ -14,6 +17,7 @@ pub fn run() {
     tauri::Builder::default()
         .register_asynchronous_uri_scheme_protocol(video_protocol::SCHEME, video_protocol::handle)
         .register_asynchronous_uri_scheme_protocol(drive_protocol::SCHEME, drive_protocol::handle)
+        .register_asynchronous_uri_scheme_protocol(remote_protocol::SCHEME, remote_protocol::handle)
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
@@ -38,9 +42,15 @@ pub fn run() {
                 }
             }
 
+            // Warm the saved-server cache the same way: the `srv://` protocol
+            // handler resolves servers without access to managed state.
+            let servers = db::get_servers(&conn).unwrap_or_default();
+
             app.manage(DbState {
                 conn: std::sync::Mutex::new(conn),
             });
+
+            remote::init(app.handle().clone(), servers);
 
             Ok(())
         })
@@ -87,6 +97,13 @@ pub fn run() {
             commands::parse_drive_folder,
             commands::drive_auth_status,
             commands::drive_disconnect,
+            commands::get_servers,
+            commands::save_server,
+            commands::delete_server,
+            commands::count_server_courses,
+            commands::test_server,
+            commands::browse_server,
+            commands::parse_server_folder,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
