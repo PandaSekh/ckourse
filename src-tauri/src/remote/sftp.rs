@@ -185,6 +185,37 @@ fn host_key_error(
     }
 }
 
+impl SftpBackend {
+    /// Read up to `len` bytes at `start` through a fresh handle, stopping early
+    /// only at EOF.
+    async fn read_chunk(&self, path: &str, start: u64, len: u64) -> Result<Vec<u8>, String> {
+        let mut file = self
+            .session
+            .open(path)
+            .await
+            .map_err(|e| format!("Couldn't open {path}: {e}"))?;
+        file.seek(std::io::SeekFrom::Start(start))
+            .await
+            .map_err(|e| format!("Couldn't seek in {path}: {e}"))?;
+
+        let want = len as usize;
+        let mut buf = vec![0u8; want];
+        let mut filled = 0usize;
+        while filled < want {
+            let n = file
+                .read(&mut buf[filled..])
+                .await
+                .map_err(|e| format!("Couldn't read {path}: {e}"))?;
+            if n == 0 {
+                break; // EOF
+            }
+            filled += n;
+        }
+        buf.truncate(filled);
+        Ok(buf)
+    }
+}
+
 #[async_trait]
 impl RemoteBackend for SftpBackend {
     async fn list_dir(&self, path: &str) -> Result<Vec<RemoteNode>, String> {
@@ -220,31 +251,36 @@ impl RemoteBackend for SftpBackend {
         if end < start {
             return Ok(Vec::new());
         }
-        let mut file = self
-            .session
-            .open(path)
-            .await
-            .map_err(|e| format!("Couldn't open {path}: {e}"))?;
-        file.seek(std::io::SeekFrom::Start(start))
-            .await
-            .map_err(|e| format!("Couldn't seek in {path}: {e}"))?;
 
-        // SFTP caps each reply at the negotiated packet size, so fill the
-        // requested window with repeated reads rather than one read_exact.
-        let want = (end - start + 1) as usize;
-        let mut buf = vec![0u8; want];
-        let mut filled = 0usize;
-        while filled < want {
-            let n = file
-                .read(&mut buf[filled..])
-                .await
-                .map_err(|e| format!("Couldn't read {path}: {e}"))?;
-            if n == 0 {
+        // SFTP caps each reply at the negotiated packet size (often 32 KB), so a
+        // single handle reads a 2 MB block as dozens of sequential round-trips —
+        // seconds of dead time on a distant server. Split the range into chunks
+        // read concurrently over their own handles instead; the requests
+        // multiplex over the one SSH connection.
+        const CHUNK: u64 = 256 * 1024;
+        let mut chunks = Vec::new();
+        let mut off = start;
+        while off <= end {
+            let len = CHUNK.min(end - off + 1);
+            chunks.push((off, len));
+            off += len;
+        }
+
+        let parts = futures::future::try_join_all(
+            chunks
+                .iter()
+                .map(|&(chunk_start, len)| self.read_chunk(path, chunk_start, len)),
+        )
+        .await?;
+
+        let mut buf = Vec::with_capacity((end - start + 1) as usize);
+        for (part, &(_, len)) in parts.iter().zip(&chunks) {
+            let short = (part.len() as u64) < len;
+            buf.extend_from_slice(part);
+            if short {
                 break; // EOF — a short final block is expected
             }
-            filled += n;
         }
-        buf.truncate(filled);
         Ok(buf)
     }
 

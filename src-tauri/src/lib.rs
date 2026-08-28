@@ -5,6 +5,7 @@ mod google;
 mod parser;
 mod remote;
 mod remote_protocol;
+mod stream_cache;
 mod subtitle;
 mod video_protocol;
 

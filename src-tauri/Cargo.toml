@@ -34,6 +34,8 @@ sha2 = "0.10"
 base64 = "0.22"
 getrandom = "0.2"
 async-trait = "0.1.92"
+# Concurrent sub-range reads inside the SFTP backend (try_join_all).
+futures = "0.3"
 russh = "0.63.1"
 russh-sftp = "2.4.0"
 rusty-s3 = "0.10.2"

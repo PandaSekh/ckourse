@@ -79,7 +79,26 @@ const MEDIA_ERROR_NAMES = [
 interface SafePlayContext {
   lessonId?: number;
   videoPath?: string;
-  trigger: "autoplay" | "togglePlay" | "keyboard" | "replay";
+  trigger: "autoplay" | "togglePlay" | "keyboard" | "replay" | "rebuffer";
+}
+
+// Starvation watchdog thresholds (remote sources): pause when the buffered
+// runway ahead of the playhead drops below STARVE_BELOW seconds, resume once it
+// recovers past RESUME_ABOVE. The gap is the hysteresis that stops flapping.
+const STARVE_BELOW = 0.5;
+const RESUME_ABOVE = 3;
+
+// Seconds of media buffered ahead of the playhead, from the buffered range that
+// contains it. No ranges at all reads as "unknown" (Infinity) so the watchdog
+// stays quiet rather than pausing on missing data it can't see.
+function bufferedAheadSeconds(v: HTMLVideoElement): number {
+  const buf = v.buffered;
+  if (buf.length === 0) return Number.POSITIVE_INFINITY;
+  const t = v.currentTime;
+  for (let i = 0; i < buf.length; i++) {
+    if (buf.start(i) <= t + 0.1 && t <= buf.end(i)) return buf.end(i) - t;
+  }
+  return 0;
 }
 
 // HTMLMediaElement.play() returns a Promise that rejects with NotSupportedError,
@@ -258,6 +277,16 @@ export const VideoPlayer = forwardRef<VideoPlayerHandle, VideoPlayerProps>(funct
   const [autoSkipRemaining, setAutoSkipRemaining] = useState(autoSkipSeconds);
   const [autoSkipCancelled, setAutoSkipCancelled] = useState(false);
 
+  // True while the starvation watchdog has the element paused waiting for data.
+  // The UI keeps reading "playing" (spinner up, pause icon) the whole time.
+  const starvedRef = useRef(false);
+  // Mirrors isSeeking for handlers that shouldn't re-render to see it.
+  const isSeekingRef = useRef(false);
+
+  const isRemoteSource =
+    !!lesson &&
+    (lesson.videoPath.startsWith("gdrive:") || lesson.videoPath.startsWith("srv:"));
+
   // Auto-skip countdown when video ends
   const autoSkipFiredRef = useRef(false);
   useEffect(() => {
@@ -325,6 +354,8 @@ export const VideoPlayer = forwardRef<VideoPlayerHandle, VideoPlayerProps>(funct
     setIsBuffering(!!lesson);
     setShowControls(true);
     setParsedTracks(new Map());
+    setBuffered(0);
+    starvedRef.current = false;
   }, [lesson?.id]);
 
   // Restore subtitle selection by language when lesson changes
@@ -461,17 +492,8 @@ export const VideoPlayer = forwardRef<VideoPlayerHandle, VideoPlayerProps>(funct
         case " ":
         case "k":
           e.preventDefault();
-          if (hasEnded) {
-            handleReplay();
-          } else if (v.paused) {
-            safePlay(v, {
-              trigger: "keyboard",
-              lessonId: lesson?.id,
-              videoPath: lesson?.videoPath,
-            });
-          } else {
-            v.pause();
-          }
+          // togglePlay knows about ended/starved states; keep one code path.
+          togglePlay();
           resetHideTimer();
           break;
         case "ArrowLeft":
@@ -556,6 +578,16 @@ export const VideoPlayer = forwardRef<VideoPlayerHandle, VideoPlayerProps>(funct
       handleReplay();
       return;
     }
+    if (starvedRef.current) {
+      // The watchdog paused the element but the UI still reads "playing" — a
+      // toggle here means the user wants a real pause.
+      starvedRef.current = false;
+      setIsBuffering(false);
+      setIsPlaying(false);
+      onPlayStateChange?.(false);
+      setShowControls(true);
+      return;
+    }
     if (videoRef.current.paused) {
       safePlay(videoRef.current, {
         trigger: "togglePlay",
@@ -565,7 +597,7 @@ export const VideoPlayer = forwardRef<VideoPlayerHandle, VideoPlayerProps>(funct
     } else {
       videoRef.current.pause();
     }
-  }, [hasEnded, lesson?.id, lesson?.videoPath]);
+  }, [hasEnded, lesson?.id, lesson?.videoPath, onPlayStateChange]);
 
   const toggleMute = useCallback(() => {
     if (!videoRef.current) return;
@@ -690,13 +722,33 @@ export const VideoPlayer = forwardRef<VideoPlayerHandle, VideoPlayerProps>(funct
     toggleFullscreen();
   }, [toggleFullscreen]);
 
-  const handleTimeUpdate = useCallback(() => {
-    if (videoRef.current) {
-      const t = videoRef.current.currentTime;
-      setVideoTime(t);
-      onTimeUpdate?.(t);
+  // Grey "loaded" bar — the buffered range the playhead is inside, like
+  // YouTube. Ranges elsewhere (left over from seeks) don't count: they'd show
+  // runway the playhead doesn't actually have.
+  const updateBuffered = useCallback(() => {
+    const v = videoRef.current;
+    if (!v || !v.duration) return;
+    const buf = v.buffered;
+    const t = v.currentTime;
+    let end = 0;
+    for (let i = 0; i < buf.length; i++) {
+      if (buf.start(i) <= t + 0.1 && t <= buf.end(i)) {
+        end = buf.end(i);
+        break;
+      }
     }
-  }, [onTimeUpdate]);
+    setBuffered(end / v.duration);
+  }, []);
+
+  const handleTimeUpdate = useCallback(() => {
+    if (!videoRef.current) return;
+    // While dragging the seek bar the drag owns the playhead display.
+    if (isSeekingRef.current) return;
+    const t = videoRef.current.currentTime;
+    setVideoTime(t);
+    onTimeUpdate?.(t);
+    updateBuffered();
+  }, [onTimeUpdate, updateBuffered]);
 
   const handleDurationChange = useCallback(() => {
     if (videoRef.current) {
@@ -714,6 +766,8 @@ export const VideoPlayer = forwardRef<VideoPlayerHandle, VideoPlayerProps>(funct
   }, [onPlayStateChange, resetHideTimer]);
 
   const handlePause = useCallback(() => {
+    // A watchdog pause isn't a user pause: keep the UI in "playing + buffering".
+    if (starvedRef.current) return;
     setIsPlaying(false);
     setIsBuffering(false);
     onPlayStateChange?.(false);
@@ -735,7 +789,47 @@ export const VideoPlayer = forwardRef<VideoPlayerHandle, VideoPlayerProps>(funct
   // `canplay`/`seeked` clear it.
   const handleWaiting = useCallback(() => setIsBuffering(true), []);
   const handlePlaying = useCallback(() => setIsBuffering(false), []);
-  const handleCanPlay = useCallback(() => setIsBuffering(false), []);
+  // `canplay` fires with only a couple of frames decoded — while the starvation
+  // watchdog is holding playback it's not enough, so keep the spinner up.
+  const handleCanPlay = useCallback(() => setIsBuffering(starvedRef.current), []);
+
+  // YouTube-style rebuffering for streamed sources. When data arrives slower
+  // than playback, WKWebView happily lets the media clock keep running and then
+  // skips frames to catch up — the "progress moves but the picture froze" bug.
+  // Watch the buffered runway ourselves: pause the element (spinner up, UI
+  // still "playing") when it runs dry, resume once a few seconds are buffered.
+  useEffect(() => {
+    if (!isRemoteSource) return;
+    const id = setInterval(() => {
+      const v = videoRef.current;
+      if (!v || hasEnded || loadError) return;
+      if (starvedRef.current) {
+        const ahead = bufferedAheadSeconds(v);
+        const bufferedToEnd =
+          Number.isFinite(v.duration) &&
+          Number.isFinite(ahead) &&
+          v.currentTime + ahead >= v.duration - 0.3;
+        if (ahead >= RESUME_ABOVE || bufferedToEnd) {
+          starvedRef.current = false;
+          setIsBuffering(false);
+          safePlay(v, {
+            trigger: "rebuffer",
+            lessonId: lesson?.id,
+            videoPath: lesson?.videoPath,
+          });
+        }
+      } else {
+        if (v.paused || v.seeking || !v.duration) return;
+        const ahead = bufferedAheadSeconds(v);
+        if (ahead < STARVE_BELOW && v.currentTime < v.duration - 1) {
+          starvedRef.current = true;
+          setIsBuffering(true);
+          v.pause();
+        }
+      }
+    }, 250);
+    return () => clearInterval(id);
+  }, [isRemoteSource, hasEnded, loadError, lesson?.id, lesson?.videoPath]);
 
   // Recover from a load/network error: clear the error, re-fetch the source, and
   // resume from where we were. The buffered chunk in our Drive proxy makes retry cheap.
@@ -743,6 +837,7 @@ export const VideoPlayer = forwardRef<VideoPlayerHandle, VideoPlayerProps>(funct
     const v = videoRef.current;
     if (!v) return;
     const resumeAt = videoTime;
+    starvedRef.current = false;
     setLoadError(null);
     setNeedsReconnect(false);
     setNeedsSetup(false);
@@ -813,14 +908,6 @@ export const VideoPlayer = forwardRef<VideoPlayerHandle, VideoPlayerProps>(funct
     return () => window.removeEventListener("online", onOnline);
   }, [loadError, needsReconnect, needsSetup, handleRetry]);
 
-  const handleProgress = useCallback(() => {
-    if (!videoRef.current || !videoRef.current.duration) return;
-    const buf = videoRef.current.buffered;
-    if (buf.length > 0) {
-      setBuffered(buf.end(buf.length - 1) / videoRef.current.duration);
-    }
-  }, []);
-
   const getSeekRatio = (e: ReactMouseEvent | MouseEvent) => {
     if (!seekBarRef.current) return 0;
     const rect = seekBarRef.current.getBoundingClientRect();
@@ -832,18 +919,28 @@ export const VideoPlayer = forwardRef<VideoPlayerHandle, VideoPlayerProps>(funct
       if (!videoRef.current || !videoDuration) return;
       e.preventDefault();
       setIsSeeking(true);
-      const ratio = getSeekRatio(e);
-      videoRef.current.currentTime = ratio * videoDuration;
+      isSeekingRef.current = true;
+
+      const commit = (r: number) => {
+        if (videoRef.current) videoRef.current.currentTime = r * videoDuration;
+      };
+      let ratio = getSeekRatio(e);
+      setVideoTime(ratio * videoDuration);
+      // Local files scrub live. Remote sources commit only on release — every
+      // scrub position would otherwise fire its own network fetches, and on a
+      // slow connection those bury the position the user actually lands on.
+      if (!isRemoteSource) commit(ratio);
 
       const handleMouseMove = (ev: MouseEvent) => {
-        if (!videoRef.current) return;
-        const r = getSeekRatio(ev);
-        videoRef.current.currentTime = r * videoDuration;
-        setVideoTime(r * videoDuration);
+        ratio = getSeekRatio(ev);
+        setVideoTime(ratio * videoDuration);
+        if (!isRemoteSource) commit(ratio);
       };
 
       const handleMouseUp = () => {
+        commit(ratio);
         setIsSeeking(false);
+        isSeekingRef.current = false;
         window.removeEventListener("mousemove", handleMouseMove);
         window.removeEventListener("mouseup", handleMouseUp);
       };
@@ -851,7 +948,7 @@ export const VideoPlayer = forwardRef<VideoPlayerHandle, VideoPlayerProps>(funct
       window.addEventListener("mousemove", handleMouseMove);
       window.addEventListener("mouseup", handleMouseUp);
     },
-    [videoDuration],
+    [videoDuration, isRemoteSource],
   );
 
   const handleSeekHover = useCallback(
@@ -923,7 +1020,7 @@ export const VideoPlayer = forwardRef<VideoPlayerHandle, VideoPlayerProps>(funct
         onPlay={handlePlay}
         onPause={handlePause}
         onEnded={handleEnded}
-        onProgress={handleProgress}
+        onProgress={updateBuffered}
         onWaiting={handleWaiting}
         onPlaying={handlePlaying}
         onCanPlay={handleCanPlay}
@@ -944,7 +1041,12 @@ export const VideoPlayer = forwardRef<VideoPlayerHandle, VideoPlayerProps>(funct
           setIsBuffering(true);
         }}
         onSeeking={() => setIsBuffering(true)}
-        onSeeked={() => setIsBuffering(false)}
+        onSeeked={() => {
+          updateBuffered();
+          // A seek that lands while the watchdog is waiting for data keeps the
+          // spinner up until the runway refills.
+          setIsBuffering(starvedRef.current);
+        }}
         onAbort={() => console.warn("[video] abort", videoSrc)}
         onError={(e) => {
           const v = e.currentTarget;
