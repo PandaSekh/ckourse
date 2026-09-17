@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
-import Lottie from "lottie-react";
+import { useLottie } from "lottie-react";
 import {
   ArrowSquareOutIcon as ArrowSquareOut,
   ArrowsOutLineHorizontalIcon as ArrowsOutLineHorizontal,
@@ -47,6 +47,12 @@ export function PdfViewer({ resource, onClose, onOpenExternally, className }: Pd
   const [containerWidth, setContainerWidth] = useState(0);
   const [currentPage, setCurrentPage] = useState(1);
   const [pageInput, setPageInput] = useState("1");
+
+  const { View: loadingAnimationView } = useLottie({
+    animationData: loadingAnimation,
+    loop: true,
+    className: "size-28",
+  });
 
   const scrollRef = useRef<HTMLDivElement>(null);
   const pageRefs = useRef<Map<number, HTMLDivElement>>(new Map());
@@ -284,7 +290,7 @@ export function PdfViewer({ resource, onClose, onOpenExternally, className }: Pd
           </div>
         ) : !doc || !baseSize ? (
           <div className="flex h-full flex-col items-center justify-center">
-            <Lottie animationData={loadingAnimation} loop className="size-28" />
+            {loadingAnimationView}
             <p className="mt-2 font-sans text-sm font-semibold text-foreground">Loading PDF...</p>
           </div>
         ) : (
