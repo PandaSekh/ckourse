@@ -615,14 +615,18 @@ function CourseDetailInner({
     try {
       await openPath(path);
     } catch (err) {
-      // Expected when the file was moved/deleted outside the app — debug-level.
       console.debug("openPath failed", err);
+      const message = err instanceof Error ? err.message : String(err);
+      const forbidden = message.startsWith("Not allowed to open path");
       reportError(err, "CourseDetail.handleOpenResource", {
         path,
-        severity: "expected",
+        severity: forbidden ? "error" : "expected",
       });
+      const fileName = path.split(/[\\/]/).pop() || path;
       toast.error("Couldn't open resource", {
-        description: "The file may have been moved or deleted.",
+        description: forbidden
+          ? `Ckourse isn't allowed to open "${fileName}". Please report this issue.`
+          : `No app could open "${fileName}". Make sure the file still exists and its drive is connected.`,
       });
     }
   };
